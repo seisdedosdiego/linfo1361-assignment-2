@@ -4,112 +4,126 @@ Auteurs : Seisdedos Stoz Diego (4659-23-00), Muylkens Justin (8004-22-00)
 """
 
 import time
+import random as _random_module
 from agent import Agent
 from oxono import Game
+
 
 # ----------------------------------------------------------------------
 # Poids de la fonction d'évaluation heuristique
 # ----------------------------------------------------------------------
-# Les poids sont asymétriques : un alignement à 3 pour NOUS est quasi
-# une victoire (on joue tout de suite), alors qu'un alignement à 3 pour
-# l'adversaire est moins urgent car on joue avant lui et on peut bloquer.
-#
-# L'indice du tuple = nombre de pièces déjà alignées (0 à 3).
-COLOR_WEIGHTS_SELF  = (0, 1, 10, 500)   # alignement exclusif par couleur (nous)
-COLOR_WEIGHTS_OPP   = (0, 1, 10, 100)   # alignement exclusif par couleur (adversaire)
-SYMBOL_WEIGHTS_SELF = (0, 1,  5, 200)   # alignement par symbole (nous)
-SYMBOL_WEIGHTS_OPP  = (0, 1,  5,  60)   # alignement par symbole (adversaire)
-
-# Bonus/pénalité pour une fourchette (au moins 2 menaces à 3 simultanées).
-# Une fourchette est quasi imparable : l'adversaire ne peut bloquer qu'une
-# menace par tour et nous en avons plusieurs.
+COLOR_WEIGHTS_SELF  = (0, 1, 10, 500)
+COLOR_WEIGHTS_OPP   = (0, 1, 10, 100)
+SYMBOL_WEIGHTS_SELF = (0, 1,  5, 200)
+SYMBOL_WEIGHTS_OPP  = (0, 1,  5,  60)
 FORK_SELF_BONUS  = 5000
 FORK_OPP_PENALTY = 2000
-
-# Valeur d'un état terminal détecté pendant la recherche.
 WIN_SCORE = 100_000
 
+
 # ----------------------------------------------------------------------
-# Pré-calcul des 36 lignes de 4 cases potentiellement gagnantes
+# Pré-calcul des 36 lignes potentiellement gagnantes sur le plateau 6x6
 # ----------------------------------------------------------------------
-# Plateau 6x6 -> 6 lignes * 3 décalages horizontaux + 6 colonnes *
-# 3 décalages verticaux = 36 lignes. On les calcule une seule fois
-# au chargement du module pour éviter de les recalculer à chaque
-# évaluation de position.
 _LINES = []
 for _r in range(6):
     for _c in range(3):
-        _LINES.append(tuple((_r, _c + i) for i in range(4)))   # lignes horizontales
+        _LINES.append(tuple((_r, _c + i) for i in range(4)))
 for _c in range(6):
     for _r in range(3):
-        _LINES.append(tuple((_r + i, _c) for i in range(4)))   # lignes verticales
+        _LINES.append(tuple((_r + i, _c) for i in range(4)))
 _LINES = tuple(_LINES)
+
+
+# ----------------------------------------------------------------------
+# Zobrist hashing - clés aléatoires 64 bits pour chaque composant d'état
+# ----------------------------------------------------------------------
+# Un hash Zobrist représente un état comme le XOR d'une clé aléatoire
+# pour chaque composant (pièce sur case, position du totem, joueur à
+# jouer). C'est extrêmement rapide à calculer et les collisions sur
+# 64 bits sont négligeables en pratique.
+_rng = _random_module.Random(42)   # seed fixe pour la reproductibilité
+_ZOBRIST_PIECE = [[
+    {
+        ('x', 0): _rng.getrandbits(64),
+        ('x', 1): _rng.getrandbits(64),
+        ('o', 0): _rng.getrandbits(64),
+        ('o', 1): _rng.getrandbits(64),
+    }
+    for _ in range(6)
+] for _ in range(6)]
+_ZOBRIST_TOTEM_O = [[_rng.getrandbits(64) for _ in range(6)] for _ in range(6)]
+_ZOBRIST_TOTEM_X = [[_rng.getrandbits(64) for _ in range(6)] for _ in range(6)]
+_ZOBRIST_PLAYER  = _rng.getrandbits(64)   # XORé quand current_player == 1
+
+
+def _zobrist_hash(state):
+    """Calcule le hash Zobrist d'un état en partant de zéro."""
+    h = 0
+    board = state.board
+    for r in range(6):
+        for c in range(6):
+            cell = board[r][c]
+            if cell is not None:
+                h ^= _ZOBRIST_PIECE[r][c][cell]
+    h ^= _ZOBRIST_TOTEM_O[state.totem_O[0]][state.totem_O[1]]
+    h ^= _ZOBRIST_TOTEM_X[state.totem_X[0]][state.totem_X[1]]
+    if state.current_player == 1:
+        h ^= _ZOBRIST_PLAYER
+    return h
+
+
+# ----------------------------------------------------------------------
+# Table de transposition
+# ----------------------------------------------------------------------
+# Pour chaque état, on stocke (profondeur_recherche, valeur, flag, meilleur_coup).
+# Les flags indiquent si la valeur est exacte ou seulement une borne
+# (résultat d'une coupure alpha-beta).
+EXACT, LOWERBOUND, UPPERBOUND = 0, 1, 2
+
+# Taille maximale de la TT (nombre d'entrées) pour respecter la limite
+# de 2 GB de RAM de l'énoncé. Au-delà, on vide la table complètement.
+# ~500k entrées * ~100 octets = ~50 MB, bien en dessous de la limite.
+_TT_MAX_ENTRIES = 500_000
+
 
 class MyAgent(Agent):
     """
-    Agent Oxono basé sur Negamax avec élagage Alpha-Beta et approfondissement itératif.
+    Agent Oxono : Negamax Alpha-Beta avec approfondissement itératif,
+    table de transposition et move ordering par meilleur coup TT.
     """
 
     def __init__(self, player):
-        """
-        Initialise l'agent.
-
-        Parameters
-        ----------
-        player : int
-            Indice du joueur (0 = rose, 1 = noir).
-        """
         super().__init__(player)
-        # Marge de sécurité (en secondes) conservée sur chaque coup pour
-        # éviter tout dépassement du budget temps et donc un timeout.
         self._safety_margin = 0.5
+        # La table de transposition est persistante entre les appels à act()
+        # car les mêmes positions peuvent être ré-évaluées au fil de la partie.
+        self._tt = {}
 
     # ------------------------------------------------------------------
     # Interface publique
     # ------------------------------------------------------------------
     def act(self, state, remaining_time):
-        """
-        Calcule et renvoie le prochain coup à jouer.
-
-        Parameters
-        ----------
-        state : State
-            État courant du jeu.
-        remaining_time : float
-            Temps (en secondes) restant sur notre horloge pour toute
-            la partie (pas seulement ce coup).
-
-        Returns
-        -------
-        tuple
-            Une action légale de la forme (totem, totem_pos, piece_pos).
-        """
         actions = Game.actions(state)
         if not actions:
-            # Cas défensif : un état non terminal possède toujours au
-            # moins une action possible, mais on ne veut pas planter.
             return None
 
-        # --- Calcul du budget de temps pour CE coup ---------------
-        # On estime qu'il nous reste à peu près autant de coups à jouer
-        # que de pièces dans notre réserve. Le budget par coup diminue
-        # donc naturellement vers la fin de la partie.
-        my_pieces = state.pieces_o[self.player] + state.pieces_x[self.player]
+        # Nettoyage de la TT si elle devient trop grosse (limite mémoire).
+        if len(self._tt) > _TT_MAX_ENTRIES:
+            self._tt.clear()
+
+        # Budget de temps pour ce coup
+        my_pieces  = state.pieces_o[self.player] + state.pieces_x[self.player]
         moves_left = max(my_pieces, 1)
         time_budget = max(
             remaining_time / (moves_left + 1) - self._safety_margin,
-            0.05,  # plancher : jamais moins de 50 ms par coup
+            0.05,
         )
         deadline = time.perf_counter() + time_budget
 
-        # --- Approfondissement itératif ---------------------------
-        # On lance une recherche complète à profondeur 1, puis 2, puis 3,
-        # etc. On conserve toujours le meilleur coup trouvé à la dernière
-        # profondeur COMPLETEMENT explorée. Si on timeout au milieu d'une
-        # profondeur, on garde le résultat de la précédente.
-        best_action = actions[0] # coup par défaut si on ne finit même pas la profondeur 1
+        # Approfondissement itératif
+        best_action = actions[0]
         depth = 1
-        while depth <= 20: # borne de sécurité
+        while depth <= 20:
             try:
                 action = self._search_root(state, depth, deadline)
                 if action is not None:
@@ -122,92 +136,121 @@ class MyAgent(Agent):
         return best_action
 
     # ------------------------------------------------------------------
-    # Recherche adverse
+    # Recherche
     # ------------------------------------------------------------------
     def _search_root(self, state, depth, deadline):
-        """
-        Recherche à la racine : renvoie la meilleure action trouvée
-        à la profondeur donnée.
+        """Recherche à la racine : essaie d'abord le meilleur coup connu (TT)."""
+        key = _zobrist_hash(state)
+        tt_entry = self._tt.get(key)
+        tt_move = tt_entry[3] if tt_entry is not None else None
 
-        Lève TimeoutError si le temps imparti est dépassé.
-        """
+        actions = self._ordered_actions(state, tt_move)
+
         best_action = None
-        best_value = -float('inf')
+        best_value  = -float('inf')
         alpha, beta = -float('inf'), float('inf')
 
-        for action in Game.actions(state):
+        for action in actions:
             if time.perf_counter() > deadline:
                 raise TimeoutError
-            # Game.apply modifie l'état en place : il faut donc copier
-            # avant d'appliquer pour ne pas polluer l'état parent.
             child = state.copy()
             Game.apply(child, action)
-            # Le fils renvoie son score de SON point de vue -> on inverse.
             value = -self._negamax(child, depth - 1, -beta, -alpha, deadline)
             if value > best_value:
-                best_value = value
+                best_value  = value
                 best_action = action
             if value > alpha:
                 alpha = value
+
+        # Stocke le résultat racine dans la TT (flag EXACT car sans coupure).
+        self._tt[key] = (depth, best_value, EXACT, best_action)
         return best_action
 
     def _negamax(self, state, depth, alpha, beta, deadline):
-        """
-        Recherche Negamax avec élagage Alpha-Beta.
-
-        La valeur renvoyée est exprimée du point de vue du joueur
-        qui doit jouer dans `state` (convention Negamax).
-        """
-        # Vérification du temps à chaque noeud pour pouvoir sortir
-        # proprement en levant une exception.
         if time.perf_counter() > deadline:
             raise TimeoutError
 
-        # Etat terminal : on renvoie directement la valeur "réelle".
-        # Game.utility(state, player) renvoie +1/-1/0 du point de vue
-        # du joueur spécifié.
+        alpha_orig = alpha
+        key = _zobrist_hash(state)
+
+        # ---- Consultation de la TT ----
+        tt_entry = self._tt.get(key)
+        tt_move = None
+        if tt_entry is not None:
+            tt_depth, tt_value, tt_flag, tt_move = tt_entry
+            # On n'utilise la valeur que si elle a été calculée à une
+            # profondeur au moins aussi grande que celle qu'on demande.
+            if tt_depth >= depth:
+                if tt_flag == EXACT:
+                    return tt_value
+                elif tt_flag == LOWERBOUND and tt_value > alpha:
+                    alpha = tt_value
+                elif tt_flag == UPPERBOUND and tt_value < beta:
+                    beta = tt_value
+                if alpha >= beta:
+                    return tt_value
+
+        # ---- Feuille : état terminal ou profondeur atteinte ----
         if Game.is_terminal(state):
             return Game.utility(state, state.current_player) * WIN_SCORE
-
-        # Profondeur atteinte : on évalue heuristiquement.
         if depth == 0:
             return self._evaluate(state, state.current_player)
 
+        # ---- Exploration récursive avec move ordering ----
+        actions = self._ordered_actions(state, tt_move)
+
         value = -float('inf')
-        for action in Game.actions(state):
+        best_move = None
+        for action in actions:
             child = state.copy()
             Game.apply(child, action)
-            # Appel récursif : alpha et beta sont inversés, car le point
-            # de vue change (c'est à l'adversaire de jouer ensuite).
             v = -self._negamax(child, depth - 1, -beta, -alpha, deadline)
             if v > value:
                 value = v
+                best_move = action
             if value > alpha:
                 alpha = value
-            # Coupure beta : l'adversaire ne laissera jamais arriver
-            # jusqu'ici, inutile d'explorer les autres coups.
             if alpha >= beta:
-                break
+                break   # coupure beta
+
+        # ---- Stockage dans la TT avec le bon flag ----
+        # UPPERBOUND : toutes les branches ont fait moins bien que alpha_orig
+        #              -> la valeur réelle est au plus `value`.
+        # LOWERBOUND : coupure beta -> la valeur réelle est au moins `value`.
+        # EXACT      : recherche complète sans coupure.
+        if value <= alpha_orig:
+            flag = UPPERBOUND
+        elif value >= beta:
+            flag = LOWERBOUND
+        else:
+            flag = EXACT
+        self._tt[key] = (depth, value, flag, best_move)
+
         return value
 
+    def _ordered_actions(self, state, tt_move=None):
+        """Renvoie les actions légales avec `tt_move` en tête si présent."""
+        actions = Game.actions(state)
+        if tt_move is None:
+            return actions
+        # Vérifie que le tt_move est bien une action légale de cet état
+        # (il devrait toujours l'être, mais on est prudent en cas de
+        # collision Zobrist extrêmement rare).
+        if tt_move not in actions:
+            return actions
+        ordered = [tt_move]
+        for a in actions:
+            if a != tt_move:
+                ordered.append(a)
+        return ordered
+
     # ------------------------------------------------------------------
-    # Fonction d'évaluation heuristique
+    # Fonction d'évaluation heuristique (identique à la v2)
     # ------------------------------------------------------------------
     def _evaluate(self, state, player):
-        """
-        Renvoie un score heuristique du point de vue de `player`.
-
-        Positif = bon pour `player`, négatif = bon pour l'adversaire.
-
-        Stratégie :
-        - Pour chaque ligne de 4 cases, score les alignements partiels
-            (couleur et symbole) en tenant compte de qui doit jouer.
-        - Bonus spécial pour les fourchettes (2+ menaces à 3 simultanées).
-        """
         board = state.board
         score = 0
 
-        # Compteurs de menaces à 3 pour détecter les fourchettes
         my_three_threats  = 0
         opp_three_threats = 0
 
@@ -219,9 +262,7 @@ class MyAgent(Agent):
 
             n = len(filled)
 
-            # ----- Potentiel d'alignement par couleur -----
-            # Ligne vivante pour une couleur seulement si toutes les
-            # pièces présentes sont de la MEME couleur.
+            # Alignement par couleur
             colors = {c[1] for c in filled}
             if len(colors) == 1:
                 color = next(iter(colors))
@@ -234,9 +275,7 @@ class MyAgent(Agent):
                     if n == 3:
                         opp_three_threats += 1
 
-            # ----- Potentiel d'alignement par symbole -----
-            # Menace partagée : biais vers le joueur qui a investi le plus
-            # de pièces dans cette ligne.
+            # Alignement par symbole
             symbols = {c[0] for c in filled}
             if len(symbols) == 1:
                 own = sum(1 for c in filled if c[1] == player)
@@ -246,8 +285,6 @@ class MyAgent(Agent):
                 elif opp > own:
                     score -= SYMBOL_WEIGHTS_OPP[n]
 
-        # ----- Bonus fourchette -----
-        # Plusieurs menaces simultanées = victoire quasi assurée.
         if my_three_threats >= 2:
             score += FORK_SELF_BONUS
         if opp_three_threats >= 2:
