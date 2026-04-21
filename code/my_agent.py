@@ -94,7 +94,7 @@ class MyAgent(Agent):
 
     def __init__(self, player):
         super().__init__(player)
-        self._safety_margin = 0.5
+        self._safety_margin = 0.3
         # La table de transposition est persistante entre les appels à act()
         # car les mêmes positions peuvent être ré-évaluées au fil de la partie.
         self._tt = {}
@@ -106,6 +106,15 @@ class MyAgent(Agent):
         actions = Game.actions(state)
         if not actions:
             return None
+        
+        # Détection d'un coup gagnant immédiat : si on peut gagner en 1,
+        # on joue ce coup sans passer par la recherche (sécurité
+        # supplémentaire au cas où la profondeur 1 n'est pas atteinte).
+        for action in actions:
+            child = state.copy()
+            Game.apply(child, action)
+            if Game.is_terminal(child) and Game.utility(child, self.player) == 1:
+                return action
 
         # Nettoyage de la TT si elle devient trop grosse (limite mémoire).
         if len(self._tt) > _TT_MAX_ENTRIES:
@@ -279,11 +288,15 @@ class MyAgent(Agent):
             symbols = {c[0] for c in filled}
             if len(symbols) == 1:
                 own = sum(1 for c in filled if c[1] == player)
-                opp = n - own
-                if own > opp:
+                opp_count = n - own
+                if own > opp_count:
                     score += SYMBOL_WEIGHTS_SELF[n]
-                elif opp > own:
+                    if n == 3:
+                        my_three_threats += 1
+                elif opp_count > own:
                     score -= SYMBOL_WEIGHTS_OPP[n]
+                    if n == 3:
+                        opp_three_threats += 1
 
         if my_three_threats >= 2:
             score += FORK_SELF_BONUS
