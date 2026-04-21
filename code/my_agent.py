@@ -8,22 +8,16 @@ import random as _random_module
 from agent import Agent
 from oxono import Game
 
-
-# ----------------------------------------------------------------------
 # Poids de la fonction d'évaluation heuristique
-# ----------------------------------------------------------------------
-COLOR_WEIGHTS_SELF  = (0, 1, 10, 500)
-COLOR_WEIGHTS_OPP   = (0, 1, 10, 100)
-SYMBOL_WEIGHTS_SELF = (0, 1,  5, 200)
-SYMBOL_WEIGHTS_OPP  = (0, 1,  5,  60)
-FORK_SELF_BONUS  = 5000
+COLOR_WEIGHTS_SELF = (0, 1, 10, 500)
+COLOR_WEIGHTS_OPP = (0, 1, 10, 100)
+SYMBOL_WEIGHTS_SELF = (0, 1, 5, 200)
+SYMBOL_WEIGHTS_OPP = (0, 1, 5, 60)
+FORK_SELF_BONUS = 5000
 FORK_OPP_PENALTY = 2000
-WIN_SCORE = 100_000
+WIN_SCORE = 100000
 
-
-# ----------------------------------------------------------------------
 # Pré-calcul des 36 lignes potentiellement gagnantes sur le plateau 6x6
-# ----------------------------------------------------------------------
 _LINES = []
 for _r in range(6):
     for _c in range(3):
@@ -33,15 +27,8 @@ for _c in range(6):
         _LINES.append(tuple((_r + i, _c) for i in range(4)))
 _LINES = tuple(_LINES)
 
-
-# ----------------------------------------------------------------------
 # Zobrist hashing - clés aléatoires 64 bits pour chaque composant d'état
-# ----------------------------------------------------------------------
-# Un hash Zobrist représente un état comme le XOR d'une clé aléatoire
-# pour chaque composant (pièce sur case, position du totem, joueur à
-# jouer). C'est extrêmement rapide à calculer et les collisions sur
-# 64 bits sont négligeables en pratique.
-_rng = _random_module.Random(42)   # seed fixe pour la reproductibilité
+_rng = _random_module.Random(42)
 _ZOBRIST_PIECE = [[
     {
         ('x', 0): _rng.getrandbits(64),
@@ -53,11 +40,10 @@ _ZOBRIST_PIECE = [[
 ] for _ in range(6)]
 _ZOBRIST_TOTEM_O = [[_rng.getrandbits(64) for _ in range(6)] for _ in range(6)]
 _ZOBRIST_TOTEM_X = [[_rng.getrandbits(64) for _ in range(6)] for _ in range(6)]
-_ZOBRIST_PLAYER  = _rng.getrandbits(64)   # XORé quand current_player == 1
-
+_ZOBRIST_PLAYER = _rng.getrandbits(64)
 
 def _zobrist_hash(state):
-    """Calcule le hash Zobrist d'un état en partant de zéro."""
+    """ Calcule le hash Zobrist d'un état en partant de zéro """
     h = 0
     board = state.board
     for r in range(6):
@@ -71,20 +57,11 @@ def _zobrist_hash(state):
         h ^= _ZOBRIST_PLAYER
     return h
 
-
-# ----------------------------------------------------------------------
 # Table de transposition
-# ----------------------------------------------------------------------
-# Pour chaque état, on stocke (profondeur_recherche, valeur, flag, meilleur_coup).
-# Les flags indiquent si la valeur est exacte ou seulement une borne
-# (résultat d'une coupure alpha-beta).
-EXACT, LOWERBOUND, UPPERBOUND = 0, 1, 2
-
-# Taille maximale de la TT (nombre d'entrées) pour respecter la limite
-# de 2 GB de RAM de l'énoncé. Au-delà, on vide la table complètement.
-# ~500k entrées * ~100 octets = ~50 MB, bien en dessous de la limite.
-_TT_MAX_ENTRIES = 500_000
-
+EXACT = 0
+LOWERBOUND = 1 
+UPPERBOUND = 2
+_TT_MAX_ENTRIES = 500000
 
 class MyAgent(Agent):
     """
@@ -95,21 +72,14 @@ class MyAgent(Agent):
     def __init__(self, player):
         super().__init__(player)
         self._safety_margin = 0.3
-        # La table de transposition est persistante entre les appels à act()
-        # car les mêmes positions peuvent être ré-évaluées au fil de la partie.
         self._tt = {}
 
-    # ------------------------------------------------------------------
-    # Interface publique
-    # ------------------------------------------------------------------
     def act(self, state, remaining_time):
         actions = Game.actions(state)
         if not actions:
             return None
         
-        # Détection d'un coup gagnant immédiat : si on peut gagner en 1,
-        # on joue ce coup sans passer par la recherche (sécurité
-        # supplémentaire au cas où la profondeur 1 n'est pas atteinte).
+        # Détection d'un coup gagnant immédiat
         for action in actions:
             child = state.copy()
             Game.apply(child, action)
@@ -144,9 +114,7 @@ class MyAgent(Agent):
             depth += 1
         return best_action
 
-    # ------------------------------------------------------------------
     # Recherche
-    # ------------------------------------------------------------------
     def _search_root(self, state, depth, deadline):
         """Recherche à la racine : essaie d'abord le meilleur coup connu (TT)."""
         key = _zobrist_hash(state)
@@ -171,7 +139,7 @@ class MyAgent(Agent):
             if value > alpha:
                 alpha = value
 
-        # Stocke le résultat racine dans la TT (flag EXACT car sans coupure).
+        # Stocke le résultat racine dans la TT (flag EXACT car sans coupure)
         self._tt[key] = (depth, best_value, EXACT, best_action)
         return best_action
 
@@ -187,8 +155,6 @@ class MyAgent(Agent):
         tt_move = None
         if tt_entry is not None:
             tt_depth, tt_value, tt_flag, tt_move = tt_entry
-            # On n'utilise la valeur que si elle a été calculée à une
-            # profondeur au moins aussi grande que celle qu'on demande.
             if tt_depth >= depth:
                 if tt_flag == EXACT:
                     return tt_value
@@ -220,13 +186,12 @@ class MyAgent(Agent):
             if value > alpha:
                 alpha = value
             if alpha >= beta:
-                break   # coupure beta
+                break
 
         # ---- Stockage dans la TT avec le bon flag ----
-        # UPPERBOUND : toutes les branches ont fait moins bien que alpha_orig
-        #              -> la valeur réelle est au plus `value`.
-        # LOWERBOUND : coupure beta -> la valeur réelle est au moins `value`.
-        # EXACT      : recherche complète sans coupure.
+        # UPPERBOUND : toutes les branches ont fait moins bien que alpha_orig -> la valeur réelle est au plus 'value'
+        # LOWERBOUND : coupure beta -> la valeur réelle est au moins 'value'
+        # EXACT : recherche complète sans coupure
         if value <= alpha_orig:
             flag = UPPERBOUND
         elif value >= beta:
@@ -243,8 +208,6 @@ class MyAgent(Agent):
         if tt_move is None:
             return actions
         # Vérifie que le tt_move est bien une action légale de cet état
-        # (il devrait toujours l'être, mais on est prudent en cas de
-        # collision Zobrist extrêmement rare).
         if tt_move not in actions:
             return actions
         ordered = [tt_move]
@@ -253,9 +216,7 @@ class MyAgent(Agent):
                 ordered.append(a)
         return ordered
 
-    # ------------------------------------------------------------------
     # Fonction d'évaluation heuristique (identique à la v2)
-    # ------------------------------------------------------------------
     def _evaluate(self, state, player):
         board = state.board
         score = 0
