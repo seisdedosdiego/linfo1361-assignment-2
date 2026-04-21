@@ -10,22 +10,24 @@ from oxono import Game
 # ----------------------------------------------------------------------
 # Poids de la fonction d'évaluation heuristique
 # ----------------------------------------------------------------------
-# L'indice du tuple = nombre de pièces déjà alignées sur une ligne de 4
-# cases (de 0 à 3). Une ligne avec 4 pièces de même couleur/symbole
-# est une victoire et est gérée par Game.is_terminal() + Game.utility(),
-# elle n'a donc pas besoin de poids ici.
+# Les poids sont asymétriques : un alignement à 3 pour NOUS est quasi
+# une victoire (on joue tout de suite), alors qu'un alignement à 3 pour
+# l'adversaire est moins urgent car on joue avant lui et on peut bloquer.
 #
-# La progression est exponentielle car une ligne à 3 pièces est une
-# menace immédiate (un coup pour gagner) : elle doit dominer fortement
-# une ligne à 2 pièces.
-COLOR_WEIGHTS = (0, 1, 10, 100)      # alignement exclusif d'une même couleur
-SYMBOL_WEIGHTS = (0, 1, 5, 50)      # alignement d'un même symbole (partagé, donc moins décisif)
+# L'indice du tuple = nombre de pièces déjà alignées (0 à 3).
+COLOR_WEIGHTS_SELF  = (0, 1, 10, 500)   # alignement exclusif par couleur (nous)
+COLOR_WEIGHTS_OPP   = (0, 1, 10, 100)   # alignement exclusif par couleur (adversaire)
+SYMBOL_WEIGHTS_SELF = (0, 1,  5, 200)   # alignement par symbole (nous)
+SYMBOL_WEIGHTS_OPP  = (0, 1,  5,  60)   # alignement par symbole (adversaire)
 
-# Valeur renvoyée lorsqu'un état terminal (victoire/défaite) est
-# détecté pendant la recherche. Elle doit écraser n'importe quelle
-# valeur heuristique pour que l'agent préfère toujours une vraie
-# victoire à une position "qui a l'air bonne".
-WIN_SCORE = 100000
+# Bonus/pénalité pour une fourchette (au moins 2 menaces à 3 simultanées).
+# Une fourchette est quasi imparable : l'adversaire ne peut bloquer qu'une
+# menace par tour et nous en avons plusieurs.
+FORK_SELF_BONUS  = 5000
+FORK_OPP_PENALTY = 2000
+
+# Valeur d'un état terminal détecté pendant la recherche.
+WIN_SCORE = 100_000
 
 # ----------------------------------------------------------------------
 # Pré-calcul des 36 lignes de 4 cases potentiellement gagnantes
@@ -195,48 +197,60 @@ class MyAgent(Agent):
         """
         Renvoie un score heuristique du point de vue de `player`.
 
-        Score positif = bon pour `player`, négatif = bon pour l'adversaire.
+        Positif = bon pour `player`, négatif = bon pour l'adversaire.
 
-        Principe : on parcourt les 36 lignes de 4 cases et on regarde,
-        pour chacune, si elle peut encore devenir une ligne gagnante
-        (par couleur ou par symbole). Plus il y a de pièces alignées,
-        plus le score est élevé.
+        Stratégie :
+        - Pour chaque ligne de 4 cases, score les alignements partiels
+            (couleur et symbole) en tenant compte de qui doit jouer.
+        - Bonus spécial pour les fourchettes (2+ menaces à 3 simultanées).
         """
         board = state.board
         score = 0
+
+        # Compteurs de menaces à 3 pour détecter les fourchettes
+        my_three_threats  = 0
+        opp_three_threats = 0
 
         for line in _LINES:
             cells = [board[r][c] for r, c in line]
             filled = [c for c in cells if c is not None]
             if not filled:
-                continue   # ligne vide : pas d'information
+                continue
+
+            n = len(filled)
 
             # ----- Potentiel d'alignement par couleur -----
-            # Une ligne ne peut encore devenir une victoire par couleur
-            # QUE si toutes les pièces présentes sont de la MEME couleur.
-            # Dès qu'il y a au moins une pièce de chaque couleur, la
-            # ligne est "morte" pour la couleur.
+            # Ligne vivante pour une couleur seulement si toutes les
+            # pièces présentes sont de la MEME couleur.
             colors = {c[1] for c in filled}
             if len(colors) == 1:
                 color = next(iter(colors))
-                w = COLOR_WEIGHTS[len(filled)]
-                score += w if color == player else -w
+                if color == player:
+                    score += COLOR_WEIGHTS_SELF[n]
+                    if n == 3:
+                        my_three_threats += 1
+                else:
+                    score -= COLOR_WEIGHTS_OPP[n]
+                    if n == 3:
+                        opp_three_threats += 1
 
             # ----- Potentiel d'alignement par symbole -----
-            # Une ligne ne peut encore devenir une victoire par symbole
-            # QUE si toutes les pièces partagent le MEME symbole.
-            # Cette menace est "partagée" : n'importe quel joueur peut
-            # la compléter en plaçant une pièce du bon symbole.
-            # On biaise le score vers le joueur qui a déjà investi le
-            # plus de pièces dans cette ligne.
+            # Menace partagée : biais vers le joueur qui a investi le plus
+            # de pièces dans cette ligne.
             symbols = {c[0] for c in filled}
             if len(symbols) == 1:
                 own = sum(1 for c in filled if c[1] == player)
-                opp = len(filled) - own
-                w = SYMBOL_WEIGHTS[len(filled)]
+                opp = n - own
                 if own > opp:
-                    score += w
+                    score += SYMBOL_WEIGHTS_SELF[n]
                 elif opp > own:
-                    score -= w
+                    score -= SYMBOL_WEIGHTS_OPP[n]
+
+        # ----- Bonus fourchette -----
+        # Plusieurs menaces simultanées = victoire quasi assurée.
+        if my_three_threats >= 2:
+            score += FORK_SELF_BONUS
+        if opp_three_threats >= 2:
+            score -= FORK_OPP_PENALTY
 
         return score
